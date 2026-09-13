@@ -1,3 +1,4 @@
+      
 # -*- coding: utf-8 -*-
 """
 ===================================
@@ -5,6 +6,8 @@ TushareFetcher - 备用数据源 1 (Priority 2)
 ===================================
 
 数据来源：Tushare Pro API（挖地兔）
+默认接入：https://jiaoch.top/（Tushare Pro 兼容网关，token 已内置；
+          可用 TUSHARE_HTTP_URL / TUSHARE_TOKEN 环境变量或 config.tushare_token 覆盖）
 特点：需要 Token、有请求配额限制
 优点：数据质量高、接口稳定
 
@@ -72,20 +75,34 @@ def _is_us_code(stock_code: str) -> bool:
     return bool(re.match(r'^[A-Z]{1,5}(\.[A-Z])?$', code))
 
 
-def _resolve_tushare_http_url() -> Optional[str]:
-    """读取 ``TUSHARE_HTTP_URL`` 环境变量并做基本校验。
+# ---------------------------------------------------------------------------
+# jiaoch.top 兼容网关默认配置
+# 说明：本文件默认通过 https://jiaoch.top/（Tushare Pro 兼容网关）取数，
+# token 已内置。如需覆盖：
+#   - 环境变量 TUSHARE_HTTP_URL  -> 自定义网关地址（需 http(s):// 前缀）
+#   - 环境变量 TUSHARE_TOKEN     -> 自定义 token（优先于内置 token）
+#   - config.tushare_token       -> 仍为最高优先级（沿用原有配置体系）
+# 注意：jiaoch.top 的 token 绑定单 IP 使用，出口 IP 变化瞬间会返回
+# 「ip超限」错误，_TushareHttpClient.query 已内置自动退避重试。
+# ---------------------------------------------------------------------------
+_JIAOCH_DEFAULT_HTTP_URL = "https://jiaoch.top/"
+_JIAOCH_DEFAULT_TOKEN = "a77fa76bb5648d622008c14a5e81268d6a4f9e5c0de7c4f1374f58a0"
 
-    - 留空 / 仅空白 / 未设置 → 返回 ``None``，调用方继续走官方默认地址。
+
+def _resolve_tushare_http_url() -> Optional[str]:
+    """返回 Tushare 接入地址。
+
+    优先级：``TUSHARE_HTTP_URL`` 环境变量 > jiaoch.top 默认网关。
+
+    - 环境变量留空 / 仅空白 / 未设置 → 返回 jiaoch.top 默认地址。
     - 设置则去掉首尾空白后返回，并校验必须是 ``http://`` 或 ``https://`` 前缀，
       避免有人误填成纯主机名（如 ``api.tushare.pro``）导致 ``requests`` 把它
       当成相对路径请求失败。
     """
     raw = os.getenv("TUSHARE_HTTP_URL")
-    if not raw:
-        return None
+    if not raw or not raw.strip():
+        return _JIAOCH_DEFAULT_HTTP_URL
     url = raw.strip()
-    if not url:
-        return None
     if not (url.startswith("http://") or url.startswith("https://")):
         raise ValueError(
             "TUSHARE_HTTP_URL 必须以 http:// 或 https:// 开头，"
@@ -94,13 +111,38 @@ def _resolve_tushare_http_url() -> Optional[str]:
     return url
 
 
+def _resolve_tushare_token(config) -> Optional[str]:
+    """返回 Tushare token。
+
+    优先级：config.tushare_token > 环境变量 TUSHARE_TOKEN > 内置 jiaoch.top token。
+    """
+    if getattr(config, "tushare_token", None):
+        return config.tushare_token
+    env_token = os.getenv("TUSHARE_TOKEN")
+    if env_token and env_token.strip():
+        return env_token.strip()
+    return _JIAOCH_DEFAULT_TOKEN
+
+
 class _TushareHttpClient:
     """Lightweight Tushare Pro client that does not require the tushare SDK."""
 
-    def __init__(self, token: str, timeout: int = 30, api_url: str = "http://api.tushare.pro") -> None:
+    def __init__(
+        self,
+        token: str,
+        timeout: int = 30,
+        api_url: str = "http://api.tushare.pro",
+        ip_retry_attempts: int = 6,
+        ip_retry_wait_seconds: float = 8.0,
+    ) -> None:
         self._token = token
         self._timeout = timeout
         self._api_url = api_url
+        # jiaoch.top 等兼容网关的 token 常绑定单 IP：出口 IP 轮换的瞬间会返回
+        # code=500「ip超限，请不到在多个ip同时使用」。这类错误属瞬时故障，
+        # 等待数秒后原样重发即可恢复，故在客户端层内置退避重试。
+        self._ip_retry_attempts = max(1, int(ip_retry_attempts))
+        self._ip_retry_wait_seconds = float(ip_retry_wait_seconds)
 
     def query(self, api_name: str, fields: str = "", **kwargs) -> pd.DataFrame:
         req_params = {
@@ -109,18 +151,33 @@ class _TushareHttpClient:
             "params": kwargs,
             "fields": fields,
         }
-        res = requests.post(self._api_url, json=req_params, timeout=self._timeout)
-        if res.status_code != 200:
-            raise Exception(f"Tushare API HTTP {res.status_code}")
 
-        result = _json.loads(res.text)
-        if result.get("code") != 0:
-            raise Exception(result.get("msg") or f"Tushare API error code {result.get('code')}")
+        last_ip_err: Optional[str] = None
+        for attempt in range(1, self._ip_retry_attempts + 1):
+            res = requests.post(self._api_url, json=req_params, timeout=self._timeout)
+            if res.status_code != 200:
+                raise Exception(f"Tushare API HTTP {res.status_code}")
 
-        data = result.get("data") or {}
-        columns = data.get("fields") or []
-        items = data.get("items") or []
-        return pd.DataFrame(items, columns=columns)
+            result = _json.loads(res.text)
+            if result.get("code") != 0:
+                msg = str(result.get("msg") or f"Tushare API error code {result.get('code')}")
+                # 「ip超限」瞬时错误：退避后重试；其余错误（403 无权限、参数错误等）立即抛出
+                if result.get("code") == 500 and "ip超限" in msg and attempt < self._ip_retry_attempts:
+                    last_ip_err = msg
+                    logger.warning(
+                        "[Tushare] 第 %d/%d 次请求 %s 撞上「%s」，%.1f 秒后重试...",
+                        attempt, self._ip_retry_attempts, api_name, msg, self._ip_retry_wait_seconds,
+                    )
+                    time.sleep(self._ip_retry_wait_seconds)
+                    continue
+                raise Exception(msg)
+
+            data = result.get("data") or {}
+            columns = data.get("fields") or []
+            items = data.get("items") or []
+            return pd.DataFrame(items, columns=columns)
+
+        raise Exception(f"{last_ip_err}（重试 {self._ip_retry_attempts} 次后仍失败）")
 
     def __getattr__(self, api_name: str):
         if api_name.startswith("_"):
@@ -182,12 +239,14 @@ class TushareFetcher(BaseFetcher):
         """
         config = get_config()
 
-        if not config.tushare_token:
+        # token 解析链：config.tushare_token > 环境变量 TUSHARE_TOKEN > 内置 jiaoch.top token
+        token = _resolve_tushare_token(config)
+        if not token:
             logger.warning("Tushare Token 未配置，此数据源不可用")
             return
 
         try:
-            self._api = self._build_api_client(config.tushare_token)
+            self._api = self._build_api_client(token)
             logger.info("Tushare API 初始化成功")
         except Exception as e:
             logger.error(f"Tushare API 初始化失败: {e}")
@@ -200,9 +259,10 @@ class TushareFetcher(BaseFetcher):
         The project already normalizes all Pro calls through the same request
         contract, so we do not need the official tushare SDK during runtime.
 
-        支持通过 ``TUSHARE_HTTP_URL`` 环境变量将请求指向自建或第三方兼容
-        端点，便于在网络无法直达 ``api.tushare.pro`` 时切换镜像/网关。
-        留空或不设置则保持官方默认地址，行为与历史版本完全一致。
+        接入地址解析（``_resolve_tushare_http_url``）：
+        - 设置 ``TUSHARE_HTTP_URL`` 环境变量时指向该地址（自建或第三方兼容端点）；
+        - 未设置时默认指向 jiaoch.top 兼容网关（token 见 ``_resolve_tushare_token``）。
+        需要回到官方地址时，设置 ``TUSHARE_HTTP_URL=http://api.tushare.pro`` 即可。
         """
         api_url = _resolve_tushare_http_url()
         if api_url:
@@ -218,7 +278,8 @@ class TushareFetcher(BaseFetcher):
         根据 Token 配置和 API 初始化状态确定优先级
 
         策略：
-        - Token 配置且 API 初始化成功：优先级 -1（绝对最高，优于 efinance）
+        - Token 可用（config / 环境变量 / 内置 jiaoch.top token）且 API 初始化成功：
+          优先级 -1（绝对最高，优于 efinance）
         - 其他情况：优先级 2（默认）
 
         Returns:
@@ -226,7 +287,7 @@ class TushareFetcher(BaseFetcher):
         """
         config = get_config()
 
-        if config.tushare_token and self._api is not None:
+        if _resolve_tushare_token(config) and self._api is not None:
             # Token 配置且 API 初始化成功，提升为最高优先级
             logger.info("✅ 检测到 TUSHARE_TOKEN 且 API 初始化成功，Tushare 数据源优先级提升为最高 (Priority -1)")
             return -1
@@ -1355,3 +1416,5 @@ if __name__ == "__main__":
             print("未获取到行业板块排名数据")
     except Exception as e:
         print(f"[行业板块排名] 获取失败: {e}")
+
+    
